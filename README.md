@@ -29,10 +29,10 @@ This project uses [vcpkg](https://vcpkg.io/) to manage dependencies. Ensure you 
     cd ChromeStealer
     ```
 
-2. Install the dependencies using vcpkg:
+2. Build the solution: 
 
     ```sh
-    vcpkg install libsodium jsoncpp sqlite3
+    Set-Location "c:\Users\YOURUSERNAME\Desktop\ChromeStealer"; & "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\MSBuild\Current\Bin\MSBuild.exe" ChromeStealer.sln /p:Configuration=Release/p:Platform=x64 
     ```
 
 3. Open the project in Visual Studio 2022.

